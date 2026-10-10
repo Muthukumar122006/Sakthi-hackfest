@@ -146,7 +146,7 @@ export function AuthPage() {
           const { data, error } = await supabase.auth.signUp({
             email: emailResult.data,
             password: values.password,
-            options: { emailRedirectTo: `${window.location.origin}/?verified=true` },
+            options: { emailRedirectTo: `${window.location.origin}/login?verified=true` },
           })
           if (error) throw error
           setNotice(data.session
@@ -197,6 +197,28 @@ export function AuthPage() {
         type: 'sms',
       })
       if (error) throw error
+      const { data: userData, error: metadataError } = await supabase.auth.updateUser({
+        data: {
+          edugenPhoneCountryIso: selectedCountry.iso,
+          edugenCallingCode: selectedCountry.callingCode,
+          edugenCountry: selectedCountry.iso,
+          edugenCurrency: selectedCountry.currency,
+          edugenCurrencyOverridden: false,
+        },
+      })
+      if (metadataError) throw metadataError
+      if (userData.user) {
+        const { error: profileError } = await supabase.from('profiles').upsert({
+          id: userData.user.id,
+          phone_e164: pendingPhone,
+          phone_country_iso: selectedCountry.iso,
+          phone_calling_code: selectedCountry.callingCode,
+          country_iso: selectedCountry.iso,
+          preferred_currency: selectedCountry.currency,
+          currency_overridden: false,
+        })
+        if (profileError) throw profileError
+      }
       navigate('/')
     } catch (error) {
       setNotice({ kind: 'error', text: providerErrorMessage(error instanceof Error ? error.message : 'Unable to verify that code.') })
