@@ -483,6 +483,8 @@ textarea::placeholder { color: #96928a; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .preview-disclosure { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #66635f; font-size: 0.75rem; }
 .preview-demo-label { padding: 5px 7px; color: #315c48; background: #edf3ee; border-radius: 6px; font-size: 0.65rem; letter-spacing: 0.06em; font-weight: 750; }
+.generated-details { display: grid; gap: 8px; padding: 12px; border: 1px solid #e5e2dc; border-radius: 12px; background: #faf9f6; color: #55534f; font-size: 0.78rem; overflow-wrap: anywhere; }
+.generated-details a { color: #315c48; }
 .preview-success { display: flex; align-items: flex-start; gap: 7px; color: #315c48; font-size: 0.77rem; }
 .preview-success svg { flex: 0 0 auto; }
 .preview-button { width: 100%; min-height: 43px; }

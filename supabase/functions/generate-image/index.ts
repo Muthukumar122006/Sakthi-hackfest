@@ -1,10 +1,20 @@
 import { createClient } from 'npm:@supabase/supabase-js@2'
 
+const appOrigin = Deno.env.get('APP_ORIGIN')?.trim() || 'http://127.0.0.1:5173'
+const parsedAppOrigin = new URL(appOrigin)
+const isLocalAppOrigin = parsedAppOrigin.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(parsedAppOrigin.hostname)
+if (parsedAppOrigin.origin !== appOrigin || (parsedAppOrigin.protocol !== 'https:' && !isLocalAppOrigin)) {
+  throw new Error('APP_ORIGIN must be an HTTPS origin, except for localhost development.')
+}
 const corsHeaders = {
-  'Access-Control-Allow-Origin': Deno.env.get('APP_ORIGIN') ?? '*',
+  'Access-Control-Allow-Origin': appOrigin,
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Vary': 'Origin',
 }
+const maximumRequestBytes = 32768
+const maximumImageBytes = 10485760
+const maximumBase64ImageLength = Math.ceil(maximumImageBytes / 3) * 4
 
 type CreativeCategory =
   | 'fun'
@@ -75,8 +85,48 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+async function readBoundedJson(request: Request): Promise<
+  { body: unknown; errorStatus?: never } | { body?: never; errorStatus: 400 | 413 }
+> {
+  const contentLength = request.headers.get('Content-Length')
+  if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) > maximumRequestBytes)) {
+    return { errorStatus: 413 }
+  }
+  if (!request.body) return { errorStatus: 400 }
+
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      totalBytes += value.byteLength
+      if (totalBytes > maximumRequestBytes) {
+        await reader.cancel()
+        return { errorStatus: 413 }
+      }
+      chunks.push(value)
+    }
+
+    const bytes = new Uint8Array(totalBytes)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return { body: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown }
+  } catch {
+    return { errorStatus: 400 }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
 function sha256(bytes: Uint8Array) {
-  return crypto.subtle.digest('SHA-256', bytes).then((hash) =>
+  const digestInput = new Uint8Array(bytes.byteLength)
+  digestInput.set(bytes)
+  return crypto.subtle.digest('SHA-256', digestInput.buffer).then((hash) =>
     [...new Uint8Array(hash)].map((value) => value.toString(16).padStart(2, '0')).join(''),
   )
 }
@@ -146,6 +196,10 @@ function validateRequest(value: unknown): GenerateRequest | null {
 }
 
 Deno.serve(async (request) => {
+  const requestOrigin = request.headers.get('Origin')
+  if (requestOrigin && requestOrigin !== appOrigin) {
+    return new Response('Origin not allowed.', { status: 403, headers: { 'Vary': 'Origin' } })
+  }
   if (request.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
   if (request.method !== 'POST') return json(405, { error: 'Use POST to create an image.' })
 
@@ -165,12 +219,10 @@ Deno.serve(async (request) => {
   const { data: authData, error: authError } = await userClient.auth.getUser()
   if (authError || !authData.user) return json(401, { error: 'Your session is no longer valid. Sign in again.' })
 
-  let body: unknown
-  try {
-    body = await request.json()
-  } catch {
-    return json(400, { error: 'The request body must be valid JSON.' })
-  }
+  const parsedBody = await readBoundedJson(request)
+  if (parsedBody.errorStatus === 413) return json(413, { error: 'The request body is too large.' })
+  if (parsedBody.errorStatus === 400) return json(400, { error: 'The request body must be valid JSON.' })
+  const body = parsedBody.body
   const input = validateRequest(body)
   if (!input) return json(400, { error: 'Check the image description, class, language, style, purpose and budget fields.' })
 
@@ -194,7 +246,7 @@ Deno.serve(async (request) => {
   }
 
   const { data: priorRequest, error: priorRequestError } = await service.from('image_requests')
-    .select('id,state,output_asset_id,reused_asset_id,method,baseline_estimate,optimized_estimate,savings_estimate,savings_percentage,estimate_currency,calculation_method,pricing_source_url,pricing_effective_from,cost_source')
+    .select('id,state,output_asset_id,reused_asset_id,method,quality_tier,requested_image_size,baseline_estimate,optimized_estimate,savings_estimate,savings_percentage,estimate_currency,calculation_method,pricing_source_url,pricing_effective_from,cost_source')
     .eq('user_id', authData.user.id)
     .eq('idempotency_key', input.idempotency_key)
     .maybeSingle()
@@ -207,7 +259,7 @@ Deno.serve(async (request) => {
     const assetId = priorRequest.output_asset_id ?? priorRequest.reused_asset_id
     if (!assetId) return json(500, { error: 'The previous request has no saved image. An administrator must review it.' })
     const { data: priorAsset, error: priorAssetError } = await service.from('educational_assets')
-      .select('storage_path,kind')
+      .select('storage_path,kind,file_size_bytes')
       .eq('id', assetId)
       .maybeSingle()
     if (priorAssetError || !priorAsset?.storage_path) {
@@ -223,6 +275,9 @@ Deno.serve(async (request) => {
       asset_id: assetId,
       state: priorRequest.state,
       method: priorRequest.method,
+      quality_tier: priorRequest.quality_tier,
+      image_size: priorRequest.requested_image_size,
+      image_file_size_bytes: priorAsset.file_size_bytes === null ? null : Number(priorAsset.file_size_bytes),
       baseline_estimate: priorRequest.baseline_estimate,
       optimized_estimate: priorRequest.optimized_estimate,
       savings_estimate: priorRequest.savings_estimate,
@@ -257,7 +312,7 @@ Deno.serve(async (request) => {
 
   const fingerprint = await requestFingerprint(input)
   let assetQuery = service.from('educational_assets')
-    .select('id,title,storage_path,school_id,kind')
+    .select('id,title,storage_path,school_id,kind,file_size_bytes')
     .eq('review_state', 'approved')
     .eq('source_prompt_hash', fingerprint)
     .eq('category', input.category)
@@ -292,6 +347,7 @@ Deno.serve(async (request) => {
         style: input.style,
         display_currency: input.display_currency,
         state: 'reused',
+        requested_image_size: null,
         method: 'Exact approved library match',
         reused_asset_id: cachedAsset.id,
         provider_currency: 'USD',
@@ -308,7 +364,15 @@ Deno.serve(async (request) => {
       })
       .select('id,state,reused_asset_id')
       .single()
-    if (saveError) return json(500, { error: 'The request matched an image, but the reuse record could not be saved.' })
+    if (saveError) {
+      // A concurrent retry may have inserted this idempotency key after the
+      // initial lookup. Treat that as an in-progress request; a retry will
+      // return its saved result without creating another request.
+      if (saveError.code === '23505') {
+        return json(409, { error: 'This request was submitted concurrently. Retry with the same request key to retrieve its result.' })
+      }
+      return json(500, { error: 'The request matched an image, but the reuse record could not be saved.' })
+    }
     return json(200, {
       request: savedRequest,
       kind: cachedAsset.kind,
@@ -316,6 +380,8 @@ Deno.serve(async (request) => {
       asset_id: cachedAsset.id,
       image_url: signedFile.signedUrl,
       state: 'reused',
+      image_size: null,
+      image_file_size_bytes: cachedAsset.file_size_bytes === null ? null : Number(cachedAsset.file_size_bytes),
       message: 'An exact, approved image was reused. No image was generated.',
       cost_source: 'estimated',
       estimated_generation_cost_avoided: baselinePrice ? Number(baselinePrice.cost_per_image) : null,
@@ -389,6 +455,7 @@ Deno.serve(async (request) => {
       target_audience: input.target_audience,
       intent: input.intent,
       quality_tier: input.quality_tier,
+      requested_image_size: selectedPrice.image_size,
       language: input.language,
       style: input.style,
       target_budget: input.target_budget ?? null,
@@ -418,7 +485,15 @@ Deno.serve(async (request) => {
     })
     .select('id')
     .single()
-  if (insertError) return json(500, { error: 'Could not save the image request.' })
+  if (insertError) {
+    // The unique (user_id, idempotency_key) index is the final guard against
+    // concurrent Edge Function invocations. Do not start another provider
+    // call when another invocation already claimed the key.
+    if (insertError.code === '23505') {
+      return json(409, { error: 'This request was submitted concurrently. Retry with the same request key to retrieve its result.' })
+    }
+    return json(500, { error: 'Could not save the image request.' })
+  }
 
   let reservationId: string | null = null
   if (school) {
@@ -429,6 +504,7 @@ Deno.serve(async (request) => {
       target_currency: budgetCurrency,
     })
     if (reservationError) {
+      console.error('Could not reserve the school budget.', queuedRequest.id, reservationError)
       const { data: possibleReservation, error: lookupError } = await service.from('school_budget_reservations')
         .select('id')
         .eq('image_request_id', queuedRequest.id)
@@ -447,7 +523,7 @@ Deno.serve(async (request) => {
       if (lookupError || updateError) {
         return json(500, { error: 'Could not reserve or safely clean up the school budget request. An administrator must review it.' })
       }
-      return json(500, { error: `Could not reserve the school budget: ${reservationError.message}` })
+      return json(503, { error: 'Could not reserve the school budget safely. Please try again or contact an administrator.' })
     }
     if (typeof reservedId !== 'string') {
       const { error: updateError } = await service.from('image_requests')
@@ -521,11 +597,13 @@ Deno.serve(async (request) => {
         output_format: 'png',
       }),
     })
-  } catch {
+  } catch (providerError) {
+    console.error('The image provider request failed.', queuedRequest.id, providerError)
     return failRequest(502, 'The image provider could not be reached. Your request was marked as failed.')
   }
 
   if (!providerResponse.ok) {
+    console.error('The image provider rejected the generation request.', queuedRequest.id, providerResponse.status)
     return failRequest(502, `The image provider returned an error (${providerResponse.status}).`)
   }
 
@@ -537,18 +615,30 @@ Deno.serve(async (request) => {
   }
   const encodedImage = providerResult.data?.[0]?.b64_json
   if (!encodedImage) {
+    console.error('The image provider response did not contain base64 image data.', queuedRequest.id)
     return failRequest(502, 'The image provider returned no image. The request was marked as failed.')
+  }
+  if (encodedImage.length > maximumBase64ImageLength || encodedImage.length % 4 !== 0) {
+    console.error('The image provider returned an image payload outside the supported size or format.', queuedRequest.id)
+    return failRequest(502, 'The generated image is invalid or larger than the 10 MiB storage limit.')
   }
   let imageBytes: Uint8Array
   try {
     imageBytes = Uint8Array.from(atob(encodedImage), (character) => character.charCodeAt(0))
-  } catch {
+  } catch (decodeError) {
+    console.error('The image provider response contained invalid base64 data.', queuedRequest.id, decodeError)
     return failRequest(502, 'The image provider returned invalid image data. Your request was marked as failed.')
   }
   if (!hasValidPng(imageBytes)) {
     return failRequest(502, 'The returned image did not pass the basic file and size check.', {
       quality_state: 'failed',
       quality_note: 'The output was empty, too small, or not a valid PNG image.',
+    })
+  }
+  if (imageBytes.byteLength > maximumImageBytes) {
+    return failRequest(502, 'The generated image is larger than the 10 MiB storage limit.', {
+      quality_state: 'failed',
+      quality_note: 'The PNG exceeds the configured private storage file-size limit.',
     })
   }
 
@@ -564,60 +654,42 @@ Deno.serve(async (request) => {
     return failRequest(500, 'The image was created but could not be saved securely.')
   }
 
-  const { data: asset, error: assetError } = await service.from('educational_assets')
-    .insert({
-      school_id: schoolId,
-      title: input.prompt.slice(0, 200),
-      description: fullPrompt,
-      subject: '',
-      category: input.category,
-      target_audience: input.target_audience,
-      intent: input.intent,
-      quality_tier: input.quality_tier,
-      grade: '',
-      language: input.language,
-      tags: [],
-      kind: 'generated',
-      review_state: schoolId ? 'pending' : 'approved',
-      visibility: schoolId ? 'school' : 'private',
-      storage_path: storagePath,
-      source_prompt_hash: fingerprint,
-      content_hash: await sha256(imageBytes),
-      licence: 'Generated for this account. Review applicable provider terms before sharing.',
-      created_by: authData.user.id,
-    })
-    .select('id')
-    .single()
-  if (assetError) {
-    const { error: removeError } = await service.storage.from('educational-images').remove([storagePath])
-    if (removeError) console.error('Could not remove an unindexed image file.', storagePath, removeError)
-    const failure = await failRequest(500, 'The image could not be added to your account library.')
-    if (removeError) return json(500, { error: 'The image could not be added to your account library, and its temporary file needs administrator cleanup.' })
-    return failure
-  }
-
-  const { error: updateError } = await service.from('image_requests').update({
-    state: 'generated',
-    output_asset_id: asset.id,
-    quality_state: 'not_checked',
-    quality_note: 'File format and image size were checked. A teacher must review the image content.',
-  }).eq('id', queuedRequest.id)
-  if (updateError) {
-    console.error('The image was saved but its request record could not be updated.', queuedRequest.id, updateError)
-    if (reservationId) {
-      const { error: settleError } = await service.rpc('settle_school_budget_reservation', {
-        target_reservation_id: reservationId,
-      })
-      if (settleError) console.error('Could not settle the school budget after saving the image.', reservationId, settleError)
-    }
-    return json(500, { error: 'The image was saved, but its request record could not be updated. An administrator may need to check the request and budget.' })
-  }
-
-  if (reservationId) {
-    const { error: settleError } = await service.rpc('settle_school_budget_reservation', {
+  let assetId: string | null = null
+  try {
+    const { data: completedAssetId, error: completionError } = await service.rpc('complete_image_generation', {
+      target_request_id: queuedRequest.id,
+      target_storage_path: storagePath,
+      target_file_size_bytes: imageBytes.byteLength,
+      target_content_hash: await sha256(imageBytes),
+      target_source_prompt_hash: await fingerprint,
+      target_description: fullPrompt,
       target_reservation_id: reservationId,
     })
-    if (settleError) return json(500, { error: 'The image is ready, but its estimated school usage could not be recorded.' })
+    if (completionError) throw completionError
+    if (typeof completedAssetId !== 'string') throw new Error('The completion service returned no asset ID.')
+    assetId = completedAssetId
+  } catch (completionError) {
+    console.error('Could not atomically complete the image request.', queuedRequest.id, completionError)
+    const { data: persistedRequest, error: verifyError } = await service.from('image_requests')
+      .select('state,output_asset_id')
+      .eq('id', queuedRequest.id)
+      .maybeSingle()
+    if (verifyError) {
+      console.error('Could not verify the image request after a completion error.', queuedRequest.id, verifyError)
+      return json(503, { error: 'The completion status could not be confirmed. Retry this request shortly; do not submit a duplicate.' })
+    }
+    if (persistedRequest?.state === 'generated' && persistedRequest.output_asset_id) {
+      assetId = persistedRequest.output_asset_id
+    } else {
+      const { error: removeError } = await service.storage.from('educational-images').remove([storagePath])
+      if (removeError) console.error('Could not remove an unindexed image file.', storagePath, removeError)
+      const failure = await failRequest(500, 'The generated image could not be finalized.')
+      if (removeError) return json(500, { error: 'The image could not be finalized, and its temporary file needs administrator cleanup.' })
+      return failure
+    }
+  }
+  if (!assetId) {
+    return json(500, { error: 'The image was saved, but the completed asset could not be identified.' })
   }
 
   const { data: signedFile, error: signedFileError } = await service.storage
@@ -627,7 +699,7 @@ Deno.serve(async (request) => {
   return json(200, {
     request_id: queuedRequest.id,
     image_url: signedFile.signedUrl,
-    asset_id: asset.id,
+    asset_id: assetId,
     state: 'generated',
     quality_state: 'not_checked',
     cost_source: 'estimated',
@@ -645,6 +717,7 @@ Deno.serve(async (request) => {
     calculation_method: 'Studio Pro published USD price minus selected-tier published USD price. Prices are estimates and exclude other service costs.',
     method: `${selectedPrice.provider}/${selectedPrice.model}`,
     image_size: selectedPrice.image_size,
+    image_file_size_bytes: imageBytes.byteLength,
     message: 'Image created. File checks passed; review the image content before using it in class.',
   })
 })

@@ -35,7 +35,7 @@ import {
   type ImageGenerationResult,
   type ProviderPrice,
 } from './edugen/repository'
-import { isSupabaseConfigured } from './auth/supabase'
+import { isSupabaseConfigured, supabaseConfigurationError } from './auth/supabase'
 
 type TierId = 'studio-pro' | 'precision-lite' | 'draft-rapid'
 type PreviewStatus = 'ready' | 'generating' | 'generated' | 'reused' | 'error'
@@ -110,6 +110,7 @@ function PlannerPage() {
   const [requestMessage, setRequestMessage] = useState<string | null>(null)
   const [generation, setGeneration] = useState<ImageGenerationResult | null>(null)
   const [generatedImageDimensions, setGeneratedImageDimensions] = useState<{ width: number; height: number } | null>(null)
+  const [generatedImageLoadFailed, setGeneratedImageLoadFailed] = useState(false)
   const [memberships, setMemberships] = useState<Membership[]>([])
   const [providerPrices, setProviderPrices] = useState<ProviderPrice[]>([])
   const [schoolId, setSchoolId] = useState('')
@@ -182,6 +183,7 @@ function PlannerPage() {
   }
   const selectedPrice = priceFor(selectedTier.id)
   const baselinePrice = priceFor(studioPro.id)
+  const selectedProviderPrice = providerPrices.find((item) => item.quality_tier === selectedTierId)
   const savings = selectedPrice !== null && baselinePrice !== null ? baselinePrice - selectedPrice : null
   const savingsPercentage = savings !== null && baselinePrice ? Math.round((savings / baselinePrice) * 100) : null
   const priceText = (price: number | null) => price === null ? 'Price not set' : formatAmount(price)
@@ -192,6 +194,8 @@ function PlannerPage() {
       return current.trim() ? `${current.trim()} — ${suggestion}` : suggestion
     })
     setGeneration(null)
+    setGeneratedImageDimensions(null)
+    setGeneratedImageLoadFailed(false)
     setPreviewStatus('ready')
     setRequestMessage(null)
   }
@@ -202,11 +206,15 @@ function PlannerPage() {
     setPreviewStatus('ready')
     setRequestMessage(null)
     setGeneration(null)
+    setGeneratedImageDimensions(null)
+    setGeneratedImageLoadFailed(false)
   }
 
   const handlePromptChange = (value: string) => {
     setPrompt(value)
     setGeneration(null)
+    setGeneratedImageDimensions(null)
+    setGeneratedImageLoadFailed(false)
     setPreviewStatus('ready')
     setRequestMessage(null)
     if (classificationChanged) return
@@ -292,6 +300,7 @@ function PlannerPage() {
     requestInFlight.current = true
     setPreviewStatus('generating')
     setGeneratedImageDimensions(null)
+    setGeneratedImageLoadFailed(false)
     const requestStartedAt = performance.now()
     try {
       const result = await generateImage({
@@ -301,7 +310,6 @@ function PlannerPage() {
       idempotencyAttempt.current = null
       setGeneration({
         ...result,
-        quality_tier: selectedTierId,
         request_duration_ms: Math.round(performance.now() - requestStartedAt),
       })
       setPreviewStatus(result.state)
@@ -412,8 +420,8 @@ function PlannerPage() {
           </div>
         </header>
 
-        {(authError || accountError) && (
-          <div className="inline-error" role="alert">{authError ?? accountError}</div>
+        {(supabaseConfigurationError || authError || accountError) && (
+          <div className="inline-error" role="alert">{supabaseConfigurationError ?? authError ?? accountError}</div>
         )}
 
         <div className="demo-banner" role="note">
@@ -597,16 +605,24 @@ function PlannerPage() {
                         </div>
                         <p className="tier-description">{tier.description}</p>
                         <div className="tier-meta">
-                          <span>Time: {tier.time}</span>
+                          <span>Provider time: Unavailable</span>
                           <span>Size: {configuredPrice?.image_size ?? 'Not set'}</span>
-                          <span className="tier-cost">{priceText(priceFor(tier.id))}{user && isSupabaseConfigured ? '' : ' example'}</span>
+                          <span className="tier-cost">Estimated cost per image: {priceText(priceFor(tier.id))}{user && isSupabaseConfigured ? '' : ' example'}</span>
                         </div>
-                        {configuredPrice && <p className="tier-description">Model: {configuredPrice.model}</p>}
+                        {configuredPrice && <p className="tier-description">Model: {configuredPrice.model} · Price date: {configuredPrice.effective_from}</p>}
                       </div>
                     </button>
                   )
                 })}
               </div>
+              {selectedProviderPrice && (
+                <p className="comparison-footnote">
+                  Price source for {selectedTier.name}:{' '}
+                  <a href={selectedProviderPrice.source_url} target="_blank" rel="noreferrer">
+                    View configured provider pricing
+                  </a>
+                </p>
+              )}
             </section>
           </div>
 
@@ -678,13 +694,19 @@ function PlannerPage() {
               <div className="preview-stage">
                 {generation ? (
                   <img
+                    key={generation.asset_id}
                     className="preview-generated-image"
                     src={generation.image_url}
                     alt="Generated educational image. Review it before use."
-                    onLoad={(event) => setGeneratedImageDimensions({
-                      width: event.currentTarget.naturalWidth,
-                      height: event.currentTarget.naturalHeight,
-                    })}
+                    onLoad={(event) => {
+                      const { naturalWidth, naturalHeight } = event.currentTarget
+                      if (naturalWidth > 0 && naturalHeight > 0) {
+                        setGeneratedImageDimensions({ width: naturalWidth, height: naturalHeight })
+                      } else {
+                        setGeneratedImageLoadFailed(true)
+                      }
+                    }}
+                    onError={() => setGeneratedImageLoadFailed(true)}
                   />
                 ) : <div className="preview-illustration" aria-hidden="true">
                   <div className="illustration-sun" />
@@ -709,17 +731,40 @@ function PlannerPage() {
                 <div className="generated-details">
                   <span>Method: {generation.state === 'reused' ? 'Approved library match' : generation.method ?? 'Provider method not returned'}</span>
                   {generation.request_duration_ms !== undefined && (
-                    <span>Total request time: {(generation.request_duration_ms / 1000).toFixed(1)} seconds (includes network and service response)</span>
+                    <span>Total request time: {(generation.request_duration_ms / 1000).toFixed(1)} seconds from request start until the service response is processed; includes network and provider wait, excludes image loading.</span>
                   )}
-                  {generation.image_size && <span>Requested image size: {generation.image_size}</span>}
+                  <span>
+                    Requested image size: {generation.image_size
+                      ? generation.image_size
+                      : generation.state === 'reused'
+                        ? 'Not applicable; a saved image was reused.'
+                        : 'Unavailable; it was not recorded for this request.'}
+                  </span>
+                  <span>
+                    Image file size: {generation.image_file_size_bytes === undefined || generation.image_file_size_bytes === null
+                      ? 'Unavailable; this stored image has no recorded byte-size metadata.'
+                      : `${formatImageFileSize(generation.image_file_size_bytes)} (${generation.image_file_size_bytes.toLocaleString('en-US')} bytes)`}
+                  </span>
                   {generatedImageDimensions && (
                     <span>Image dimensions: {generatedImageDimensions.width} × {generatedImageDimensions.height} pixels</span>
                   )}
+                  {!generatedImageDimensions && generatedImageLoadFailed && (
+                    <span>Image dimensions: Unavailable — the image could not be loaded to read its pixel dimensions.</span>
+                  )}
+                  {!generatedImageDimensions && !generatedImageLoadFailed && (
+                    <span>Image dimensions: Loading from the saved image…</span>
+                  )}
                   <span>
-                    Resource profile: {tiers.find((tier) => tier.id === generation.quality_tier)?.name ?? 'Selected quality'}; a relative quality tier only. Provider compute and energy use are not reported.
+                    Selected quality: {tiers.find((tier) => tier.id === generation.quality_tier)?.name ?? 'Not recorded'} (relative quality tier).
                   </span>
                   <span>
-                    {generation.state === 'reused' ? 'Avoided image-generation estimate' : 'Selected image estimate'}:{' '}
+                    Provider generation time: {generation.state === 'reused'
+                      ? 'Not applicable; the image was reused.'
+                      : 'Unavailable — the provider does not expose a verifiable generation-duration measurement.'}
+                  </span>
+                  <span>Compute/energy usage: Unavailable — not exposed by the provider.</span>
+                  <span>
+                    {generation.state === 'reused' ? 'Avoided image-generation estimate per image' : 'Selected image estimate per image'}:{' '}
                     {generation.optimized_estimate === undefined
                       ? 'Not available'
                       : `${formatCurrencyAmount(generation.optimized_estimate, generation.estimate_currency ?? generation.provider_currency ?? 'USD')} (estimate, not a bill)`}
@@ -777,7 +822,7 @@ function PlannerPage() {
             <div className="comparison-tier current-tier">
               <span className="mini-label">Selected option</span>
               <strong>{selectedTier.name}</strong>
-              <span>{priceText(selectedPrice)}{user && isSupabaseConfigured ? '' : ' example'} price · {providerPrices.find((item) => item.quality_tier === selectedTier.id)?.image_size ?? 'Size not set'}</span>
+              <span>Estimated cost per image: {priceText(selectedPrice)}{user && isSupabaseConfigured ? '' : ' example'} · {providerPrices.find((item) => item.quality_tier === selectedTier.id)?.image_size ?? 'Size not set'}</span>
             </div>
             <div className="comparison-difference">
               <span className="mini-label">Potential difference</span>
@@ -787,10 +832,14 @@ function PlannerPage() {
             <div className="comparison-tier">
               <span className="mini-label">Highest quality</span>
               <strong>High Quality</strong>
-              <span>{priceText(baselinePrice)}{user && isSupabaseConfigured ? '' : ' example'} price · High resource use</span>
+              <span>Estimated cost per image: {priceText(baselinePrice)}{user && isSupabaseConfigured ? '' : ' example'} · High Quality</span>
             </div>
           </div>
-          <p className="comparison-footnote">Prices are simulated examples until a provider price list is configured. Resource levels are not energy measurements.</p>
+          <p className="comparison-footnote">
+            {user && isSupabaseConfigured
+              ? 'Prices are configured estimates, not actual bills. Check the provider source and effective date on each quality option.'
+              : 'Prices are simulated examples, not current provider prices. Resource levels are not energy measurements.'}
+          </p>
         </section>
 
         <footer className="app-footer">EduGen Smart · Energy use is not measured. Review images before classroom use.</footer>
@@ -805,6 +854,12 @@ function formatCurrencyAmount(amount: number, currencyCode: string) {
     currency: currencyCode,
     maximumFractionDigits: 6,
   }).format(amount)
+}
+
+function formatImageFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KiB`
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`
 }
 
 export default App

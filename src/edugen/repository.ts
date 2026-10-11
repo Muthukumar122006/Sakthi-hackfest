@@ -17,6 +17,7 @@ export type EducationalAsset = {
   review_state: 'pending' | 'approved' | 'rejected'
   source_url: string | null
   storage_path: string | null
+  file_size_bytes?: number | null
   preview_url: string | null
   licence: string | null
   attribution: string | null
@@ -107,7 +108,8 @@ export type ImageGenerationResult = {
   cost_source?: 'estimated' | 'projected'
   price_effective_from?: string
   method?: string
-  image_size?: string
+  image_size?: string | null
+  image_file_size_bytes?: number | null
   quality_tier?: 'studio-pro' | 'precision-lite' | 'draft-rapid'
   request_duration_ms?: number
   message: string
@@ -122,7 +124,7 @@ export async function loadAssets(search = ''): Promise<EducationalAsset[]> {
   const client = requireClient()
   const { data, error } = await client
     .from('educational_assets')
-    .select('id,title,description,subject,intent,grade,category,target_audience,language,tags,kind,review_state,storage_path,source_url,licence,attribution,created_at')
+    .select('id,title,description,subject,intent,grade,category,target_audience,language,tags,kind,review_state,storage_path,file_size_bytes,source_url,licence,attribution,created_at')
     .eq('review_state', 'approved')
     .order('created_at', { ascending: false })
     .limit(100)
@@ -151,7 +153,7 @@ export async function loadAssetsForReview(schoolId: string): Promise<Educational
   const client = requireClient()
   const { data, error } = await client
     .from('educational_assets')
-    .select('id,title,description,subject,intent,grade,category,target_audience,language,tags,kind,review_state,storage_path,source_url,licence,attribution,created_at')
+    .select('id,title,description,subject,intent,grade,category,target_audience,language,tags,kind,review_state,storage_path,file_size_bytes,source_url,licence,attribution,created_at')
     .eq('school_id', schoolId)
     .eq('review_state', 'pending')
     .order('created_at', { ascending: false })
@@ -276,6 +278,12 @@ export async function generateImage(input: {
     amount === null || (typeof amount === 'number' && Number.isFinite(amount) && amount >= 0)
   const savingsIsValid = (amount: unknown): amount is number | null =>
     amount === null || (typeof amount === 'number' && Number.isFinite(amount))
+  const fileSizeIsValid = (amount: unknown): amount is number | null | undefined =>
+    amount === undefined || amount === null || (typeof amount === 'number' && Number.isSafeInteger(amount) && amount >= 0)
+  const imageSizeIsValid = (size: unknown): size is string | null | undefined =>
+    size === undefined || size === null || typeof size === 'string'
+  const qualityTierIsValid = (tier: unknown): tier is ImageGenerationResult['quality_tier'] =>
+    tier === undefined || tier === 'studio-pro' || tier === 'precision-lite' || tier === 'draft-rapid'
   if (typeof data !== 'object' || data === null
     || typeof data.request_id !== 'string'
     || typeof data.image_url !== 'string'
@@ -299,5 +307,10 @@ export async function generateImage(input: {
     || (data.cost_source !== 'estimated' && data.cost_source !== 'projected')) {
     throw new Error('The image service returned an incomplete response.')
   }
-  return data as ImageGenerationResult
+  return {
+    ...data,
+    image_file_size_bytes: fileSizeIsValid(data.image_file_size_bytes) ? data.image_file_size_bytes ?? null : null,
+    image_size: imageSizeIsValid(data.image_size) ? data.image_size ?? null : null,
+    quality_tier: qualityTierIsValid(data.quality_tier) ? data.quality_tier : undefined,
+  } as ImageGenerationResult
 }
