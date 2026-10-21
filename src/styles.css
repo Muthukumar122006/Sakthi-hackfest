@@ -513,9 +513,10 @@ textarea::placeholder { color: #96928a; }
   .nav-item { flex: 0 0 auto; padding: 8px 10px; font-size: 0.82rem; }
   .sidebar-panel { display: block; margin-top: 0; }
   .content { padding: 20px 16px 18px; }
-  .topbar { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
-  .topbar-brand { justify-self: end; }
-  .topbar-actions { grid-column: 1 / -1; justify-self: start; }
+  .topbar { grid-template-columns: minmax(0, 1fr); align-items: start; }
+  .topbar-brand { grid-column: 1; grid-row: 1; justify-self: center; }
+  .topbar > div:first-child { grid-column: 1; grid-row: 2; }
+  .topbar-actions { grid-column: 1; grid-row: 3; justify-self: start; }
   .page-intro { font-size: 0.9rem; }
   .demo-banner { align-items: flex-start; flex-wrap: wrap; font-size: 0.78rem; }
   .workspace-grid { gap: 14px; }

@@ -26,14 +26,17 @@ import {
   type EducationalIntent,
 } from './edugen/intent'
 import { WorkspacePage } from './edugen/WorkspacePage'
+import { ImageOperationsPage } from './edugen/ImageOperationsPage'
 import {
   generateImage,
   loadMemberships,
   loadProfilePreferences,
   loadProviderPrices,
+  recommendQualityFromBackend,
   type Membership,
   type ImageGenerationResult,
   type ProviderPrice,
+  type QualityRecommendation,
 } from './edugen/repository'
 import { isSupabaseConfigured, supabaseConfigurationError } from './auth/supabase'
 
@@ -54,7 +57,7 @@ const tiers: Tier[] = [
     name: 'High Quality',
     quality: 'Most detail',
     time: 'Not available',
-    cost: 4.5,
+    cost: 4.25,
     description: 'Choose this for detail-heavy prompts when the configured model supports it.',
   },
   {
@@ -62,7 +65,7 @@ const tiers: Tier[] = [
     name: 'Balanced',
     quality: 'Good detail',
     time: 'Not available',
-    cost: 2.25,
+    cost: 2.1,
     description: 'A middle choice for everyday images.',
   },
   {
@@ -70,7 +73,7 @@ const tiers: Tier[] = [
     name: 'Budget',
     quality: 'Basic',
     time: 'Not available',
-    cost: 1.1,
+    cost: 1,
     description: 'A lower-price choice for simple images.',
   },
 ]
@@ -89,6 +92,7 @@ function App() {
       <Route path="/budgets" element={<WorkspacePage page="budgets" />} />
       <Route path="/settings" element={<WorkspacePage page="settings" />} />
       <Route path="/generate" element={<PlannerPage />} />
+      <Route path="/image-operations" element={<ImageOperationsPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
@@ -113,8 +117,14 @@ function PlannerPage() {
   const [generatedImageLoadFailed, setGeneratedImageLoadFailed] = useState(false)
   const [memberships, setMemberships] = useState<Membership[]>([])
   const [providerPrices, setProviderPrices] = useState<ProviderPrice[]>([])
+  const [providerPricingStatus, setProviderPricingStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [schoolId, setSchoolId] = useState('')
   const [priceError, setPriceError] = useState<string | null>(null)
+  const [recommendationError, setRecommendationError] = useState<string | null>(null)
+  const [serverRecommendation, setServerRecommendation] = useState<{
+    signature: string
+    value: QualityRecommendation
+  } | null>(null)
   const [selectedTierId, setSelectedTierId] = useState<TierId>('precision-lite')
   const [qualityManuallySelected, setQualityManuallySelected] = useState(false)
   const requestInFlight = useRef(false)
@@ -129,7 +139,6 @@ function PlannerPage() {
     rateError,
     rateLoading,
     saveError,
-    formatAmount,
     setCurrency,
     resetCurrency,
   } = useCurrency()
@@ -139,14 +148,28 @@ function PlannerPage() {
     if (!user || !isSupabaseConfigured) {
       setMemberships([])
       setSchoolId('')
+      setProviderPrices([])
+      setProviderPricingStatus('idle')
+      setPriceError(null)
       return
     }
     let active = true
-    void Promise.all([loadMemberships(), loadProviderPrices(), loadProfilePreferences(user)]).then(([items, prices, profile]) => {
+    setProviderPricingStatus('loading')
+    setPriceError(null)
+    void loadProviderPrices().then((prices) => {
+      if (!active) return
+      setProviderPrices(prices)
+      setProviderPricingStatus('ready')
+    }).catch((loadError: unknown) => {
+      if (!active) return
+      setProviderPrices([])
+      setProviderPricingStatus('error')
+      setPriceError(loadError instanceof Error ? loadError.message : 'Could not load current provider pricing.')
+    })
+    void Promise.all([loadMemberships(), loadProfilePreferences(user)]).then(([items, profile]) => {
       if (!active) return
       setMemberships(items)
       setSchoolId((current) => current || items[0]?.school_id || '')
-      setProviderPrices(prices)
       if (profile) {
         setCategory(profile.default_category ?? 'educational')
         setTargetAudience(profile.default_audience ?? 'All ages')
@@ -154,7 +177,7 @@ function PlannerPage() {
         setStyle(profile.default_style ?? 'simple illustration')
       }
     }).catch((loadError: unknown) => {
-      if (active) setPriceError(loadError instanceof Error ? loadError.message : 'Could not load current provider settings.')
+      if (active) setAccountError(loadError instanceof Error ? loadError.message : 'Could not load account settings.')
     })
     return () => { active = false }
   }, [authLoading, user])
@@ -162,12 +185,48 @@ function PlannerPage() {
   const audienceValue = targetAudience === 'Custom age range'
     ? `Custom ages ${customAgeStart}-${customAgeEnd}`
     : targetAudience
-  const recommendation = recommendQuality({
+  const targetBudgetValue = targetBudget.trim() ? Number(targetBudget) : null
+  const recommendationInput = {
     prompt: `${prompt} ${customPurpose} ${customCategory}`,
     category,
     intent: purpose,
     targetAudience: audienceValue,
-  })
+    targetBudget: targetBudgetValue,
+    budgetCurrency: currency,
+  }
+  const localRecommendation = recommendQuality(recommendationInput)
+  const recommendationSignature = JSON.stringify({ ...recommendationInput, targetBudgetText: targetBudget })
+  const recommendation = serverRecommendation?.signature === recommendationSignature
+    ? { tier: serverRecommendation.value.tier, explanation: serverRecommendation.value.reason }
+    : localRecommendation
+  useEffect(() => {
+    if (!user || !isSupabaseConfigured) {
+      setServerRecommendation(null)
+      setRecommendationError(null)
+      return
+    }
+    if (targetBudgetValue !== null && (!Number.isFinite(targetBudgetValue) || targetBudgetValue < 0)) {
+      setRecommendationError('Enter a valid maximum budget to include it in the quality suggestion.')
+      return
+    }
+    let active = true
+    const timeout = window.setTimeout(() => {
+      setRecommendationError(null)
+      void recommendQualityFromBackend({
+        ...recommendationInput,
+        selectedTier: selectedTierId,
+      }).then((value) => {
+        if (active) setServerRecommendation({ signature: recommendationSignature, value })
+      }).catch((error: unknown) => {
+        if (!active) return
+        setRecommendationError(error instanceof Error ? error.message : 'Could not get a quality recommendation.')
+      })
+    }, 300)
+    return () => {
+      active = false
+      window.clearTimeout(timeout)
+    }
+  }, [user, recommendationSignature, selectedTierId])
   const recommendedTier = user && isSupabaseConfigured && !providerPrices.some((price) => price.quality_tier === recommendation.tier)
     ? [...providerPrices].sort((left, right) => Number(left.cost_per_image) - Number(right.cost_per_image))[0]?.quality_tier ?? recommendation.tier
     : recommendation.tier
@@ -186,7 +245,20 @@ function PlannerPage() {
   const selectedProviderPrice = providerPrices.find((item) => item.quality_tier === selectedTierId)
   const savings = selectedPrice !== null && baselinePrice !== null ? baselinePrice - selectedPrice : null
   const savingsPercentage = savings !== null && baselinePrice ? Math.round((savings / baselinePrice) * 100) : null
-  const priceText = (price: number | null) => price === null ? 'Price not set' : formatAmount(price)
+  const priceText = (price: number | null) => {
+    if (price !== null) return formatCurrencyAmount(price, 'USD')
+    if (!user || !isSupabaseConfigured) return 'Price not set'
+    if (providerPricingStatus === 'loading') return 'Loading current price…'
+    if (providerPricingStatus === 'error') return 'Pricing service unavailable'
+    return 'Not configured'
+  }
+  const priceSizeText = (tierId: TierId) => {
+    const configuredPrice = providerPrices.find((price) => price.quality_tier === tierId)
+    if (configuredPrice) return configuredPrice.image_size
+    if (providerPricingStatus === 'loading') return 'Checking…'
+    if (providerPricingStatus === 'error') return 'Unavailable'
+    return 'Not configured'
+  }
   const purposeLabel = intentOptions.find((option) => option.value === purpose)?.label ?? 'Other picture'
   const addPromptSuggestion = (suggestion: string) => {
     setPrompt((current) => {
@@ -262,14 +334,30 @@ function PlannerPage() {
       setRequestMessage('Enter a valid custom age range, with the first age no greater than the second.')
       return
     }
+    if (targetBudgetValue !== null && (!Number.isFinite(targetBudgetValue) || targetBudgetValue < 0)) {
+      setPreviewStatus('error')
+      setRequestMessage('Enter a valid maximum budget, or leave it empty.')
+      return
+    }
     if (!user || !isSupabaseConfigured) {
       setPreviewStatus('error')
       setRequestMessage('Sign in and connect Supabase to save a request. Image generation is not set up.')
       return
     }
+    if (providerPricingStatus === 'loading') {
+      setPreviewStatus('error')
+      setRequestMessage('Current provider pricing is still loading. Try again shortly.')
+      return
+    }
+    if (providerPricingStatus === 'error') {
+      setPreviewStatus('error')
+      setRequestMessage('The pricing service could not be reached, so this request was not sent. Try again later.')
+      return
+    }
     if (selectedPrice === null) {
       setPreviewStatus('error')
-      setRequestMessage('This quality has no current provider price and is not available. Ask an admin to configure it.')
+      const size = selectedProviderPrice ? ` for ${selectedProviderPrice.image_size}` : ' because no supported image size is configured'
+      setRequestMessage(`No current price is configured for ${selectedTier.name}${size}. Contact your organization administrator.`)
       return
     }
     if (baselinePrice === null) {
@@ -289,7 +377,7 @@ function PlannerPage() {
       style,
       quality_tier: selectedTierId,
       school_id: schoolId || null,
-      target_budget: targetBudget ? Number(targetBudget) : null,
+      target_budget: targetBudgetValue,
       target_budget_currency: currency,
       display_currency: currency,
     }
@@ -423,13 +511,21 @@ function PlannerPage() {
         {(supabaseConfigurationError || authError || accountError) && (
           <div className="inline-error" role="alert">{supabaseConfigurationError ?? authError ?? accountError}</div>
         )}
+        {!isSupabaseConfigured && !supabaseConfigurationError && (
+          <div className="demo-banner" role="note">
+            <span className="demo-banner-dot" />
+            <strong>SUPABASE NOT CONNECTED</strong>
+            <span>Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to the root .env.local file, then restart the app to enable sign-in.</span>
+          </div>
+        )}
 
         <div className="demo-banner" role="note">
           <span className="demo-banner-dot" />
           <strong>{user ? 'SUPABASE IMAGE SERVICE' : 'DEMO MODE'}</strong>
           <span>Generation needs a configured provider and source-linked prices. Demo prices are examples only.</span>
         </div>
-        {priceError && <div className="inline-error" role="alert">{priceError}</div>}
+        {priceError && <div className="inline-error" role="alert">Could not load current provider pricing: {priceError} Image generation is unavailable until the pricing service responds.</div>}
+        {recommendationError && <div className="inline-error" role="alert">{recommendationError} A local rule-based suggestion is shown instead.</div>}
 
         <section className="workspace-grid" id="create">
           <div className="workflow-column">
@@ -531,24 +627,23 @@ function PlannerPage() {
                   </button>
                 ))}
               </div>
-              {purpose === 'general_illustration' && (
-                <label className="custom-purpose-field" htmlFor="custom-purpose">
-                  What else do you need? (optional)
-                  <input
-                    id="custom-purpose"
-                    className="custom-purpose-input"
-                    value={customPurpose}
-                    onChange={(event) => {
-                      setCustomPurpose(event.target.value)
-                      setGeneration(null)
-                      setPreviewStatus('ready')
-                      setRequestMessage(null)
-                    }}
-                    maxLength={500}
-                    placeholder="Write your wish here"
-                  />
-                </label>
-              )}
+              <label className="custom-purpose-field" htmlFor="custom-purpose">
+                Add your own wish (optional)
+                <textarea
+                  id="custom-purpose"
+                  className="custom-purpose-input"
+                  value={customPurpose}
+                  onChange={(event) => {
+                    setCustomPurpose(event.target.value)
+                    setGeneration(null)
+                    setPreviewStatus('ready')
+                    setRequestMessage(null)
+                  }}
+                  maxLength={500}
+                  rows={2}
+                  placeholder="Write any extra details you want"
+                />
+              </label>
             </section>
 
             <section className="panel" id="tiers">
@@ -567,7 +662,7 @@ function PlannerPage() {
                     <button type="button" className="use-recommendation-button" onClick={() => {
                       setSelectedTierId(recommendedTier)
                       setQualityManuallySelected(false)
-                    }}>Use AI recommendation</button>
+                    }}>Use suggested option</button>
                   )}
                 </p>
               </div>
@@ -606,10 +701,10 @@ function PlannerPage() {
                         <p className="tier-description">{tier.description}</p>
                         <div className="tier-meta">
                           <span>Provider time: Unavailable</span>
-                          <span>Size: {configuredPrice?.image_size ?? 'Not set'}</span>
+                          <span>Size: {priceSizeText(tier.id)}</span>
                           <span className="tier-cost">Estimated cost per image: {priceText(priceFor(tier.id))}{user && isSupabaseConfigured ? '' : ' example'}</span>
                         </div>
-                        {configuredPrice && <p className="tier-description">Model: {configuredPrice.model} · Price date: {configuredPrice.effective_from}</p>}
+                        {configuredPrice && <p className="tier-description">Provider/model: {configuredPrice.provider}/{configuredPrice.model} · {configuredPrice.pricing_unit.replace('_', ' ')} · Price date: {configuredPrice.effective_from}</p>}
                       </div>
                     </button>
                   )
@@ -644,7 +739,7 @@ function PlannerPage() {
               </div>
               <div className="estimate-metrics">
                 <div className="estimate-metric">
-                  <span className="mini-label">{user && isSupabaseConfigured ? 'Provider price estimate' : 'Example price'}</span>
+                  <span className="mini-label">{user && isSupabaseConfigured ? 'Provider price estimate (USD)' : 'Example price (USD)'}</span>
                   <strong>{priceText(selectedPrice)}</strong>
                 </div>
                 <div className="estimate-metric">
@@ -656,7 +751,7 @@ function PlannerPage() {
                   <strong>{selectedTier.time}</strong>
                 </div>
                 <div className="estimate-metric baseline-metric">
-                  <span className="mini-label">High Quality baseline</span>
+                  <span className="mini-label">High Quality baseline (USD estimate)</span>
                   <strong>{priceText(baselinePrice)}</strong>
                 </div>
               </div>
@@ -664,7 +759,7 @@ function PlannerPage() {
                 <div className="savings-icon"><Leaf size={18} /></div>
                 <div>
                   <span className="mini-label">{savings !== null && savings < 0 ? 'Extra cost vs High Quality' : 'Estimated savings'}</span>
-                  <strong>{savings === null ? 'Not available' : `${formatAmount(Math.abs(savings))}${savingsPercentage === null ? '' : ` (${Math.abs(savingsPercentage)}%)`}`}</strong>
+                  <strong>{savings === null ? 'Not available' : `${formatCurrencyAmount(Math.abs(savings), 'USD')}${savingsPercentage === null ? '' : ` (${Math.abs(savingsPercentage)}%)`}`}</strong>
                 </div>
                 <ArrowDownRight size={18} className="savings-arrow" />
               </div>
@@ -757,6 +852,7 @@ function PlannerPage() {
                   <span>
                     Selected quality: {tiers.find((tier) => tier.id === generation.quality_tier)?.name ?? 'Not recorded'} (relative quality tier).
                   </span>
+                  {generation.provider && <span>Provider: {generation.provider}{generation.pricing_unit ? ` · priced ${generation.pricing_unit.replace('_', ' ')}` : ''}</span>}
                   <span>
                     Provider generation time: {generation.state === 'reused'
                       ? 'Not applicable; the image was reused.'
@@ -822,17 +918,17 @@ function PlannerPage() {
             <div className="comparison-tier current-tier">
               <span className="mini-label">Selected option</span>
               <strong>{selectedTier.name}</strong>
-              <span>Estimated cost per image: {priceText(selectedPrice)}{user && isSupabaseConfigured ? '' : ' example'} · {providerPrices.find((item) => item.quality_tier === selectedTier.id)?.image_size ?? 'Size not set'}</span>
+              <span>Estimated cost per image (USD): {priceText(selectedPrice)}{user && isSupabaseConfigured ? '' : ' example'} · {priceSizeText(selectedTier.id)}</span>
             </div>
             <div className="comparison-difference">
               <span className="mini-label">Potential difference</span>
-              <strong>{savings === null ? 'Not available' : `${formatAmount(Math.abs(savings))} ${savings < 0 ? 'more' : 'less'}`}</strong>
+              <strong>{savings === null ? 'Not available' : `${formatCurrencyAmount(Math.abs(savings), 'USD')} ${savings < 0 ? 'more' : 'less'}`}</strong>
               <span>{savingsPercentage === null ? 'Savings unavailable' : `${Math.abs(savingsPercentage)}% ${savingsPercentage < 0 ? 'extra cost' : 'estimated savings'}`}</span>
             </div>
             <div className="comparison-tier">
               <span className="mini-label">Highest quality</span>
               <strong>High Quality</strong>
-              <span>Estimated cost per image: {priceText(baselinePrice)}{user && isSupabaseConfigured ? '' : ' example'} · High Quality</span>
+              <span>Estimated cost per image (USD): {priceText(baselinePrice)}{user && isSupabaseConfigured ? '' : ' example'} · High Quality</span>
             </div>
           </div>
           <p className="comparison-footnote">

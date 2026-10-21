@@ -18,7 +18,7 @@ import {
   Sparkles,
 } from 'lucide-react'
 import { countries, type Country } from '../data/countries'
-import { supabase } from './supabase'
+import { supabase, supabaseConfigurationError } from './supabase'
 
 type AuthMethod = 'email' | 'phone'
 type AuthMode = 'sign-in' | 'sign-up'
@@ -42,6 +42,9 @@ const resetPasswordSchema = z.string().min(8, 'Use at least 8 characters for you
 function providerErrorMessage(message: string) {
   if (/rate|too many|limit/i.test(message)) return 'Too many attempts. Please wait before trying again.'
   if (/expired|invalid.*(otp|token|code)|token.*invalid/i.test(message)) return 'That code is invalid or expired. Request a new code and try again.'
+  if (/invalid login credentials|email or password/i.test(message)) return 'The email or password is incorrect. Check both and try again.'
+  if (/email not confirmed/i.test(message)) return 'Please verify your email before signing in.'
+  if (/user already registered|already registered/i.test(message)) return 'An account already uses this email. Sign in instead.'
   return message
 }
 
@@ -104,7 +107,8 @@ export function AuthPage() {
     if (!supabase) {
       setNotice({
         kind: 'error',
-        text: 'Authentication is not connected. Configure the Supabase URL and anon key to enable sign-in; you can still explore in guest demo mode.',
+        text: supabaseConfigurationError
+          ?? 'Sign-in is not connected. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to the root .env.local file, then restart the development server. You can still explore in guest demo mode.',
       })
       return
     }
@@ -443,7 +447,12 @@ export function AuthPage() {
           {!supabase && (
             <div className="auth-demo-note">
               <span className="demo-banner-dot" />
-              <p><strong>Development demo mode.</strong> Authentication is not configured. Provider actions will not pretend to succeed.</p>
+              <p>
+                <strong>Guest demo mode.</strong>{' '}
+                {supabaseConfigurationError
+                  ?? 'To enable sign-in, add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to the root .env.local file, then restart the development server.'}{' '}
+                Demo actions will not create accounts or generate images.
+              </p>
             </div>
           )}
           <div className="auth-divider"><span>or</span></div>

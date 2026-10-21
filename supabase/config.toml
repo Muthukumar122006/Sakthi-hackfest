@@ -32,3 +32,9 @@ enable_confirmations = true
 
 [functions.generate-image]
 verify_jwt = true
+
+[functions.planner-services]
+verify_jwt = true
+
+[functions.resolve-image-request]
+verify_jwt = true

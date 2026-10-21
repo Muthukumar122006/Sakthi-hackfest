@@ -9,12 +9,15 @@ import { categoryLabels, creativeCategories, type CreativeCategory } from './int
 import {
   loadAssets,
   loadAssetsForReview,
+  loadAssetReviewHistory,
   loadMemberships,
   loadProfilePreferences,
   loadRequests,
   saveProfilePreferences,
   approveSchoolAsset,
+  rejectSchoolAsset,
   type EducationalAsset,
+  type AssetReviewHistoryEntry,
   type ImageRequest,
   type Membership,
 } from './repository'
@@ -70,6 +73,7 @@ export function WorkspacePage({ page }: { page: WorkspacePageName }) {
   const [requests, setRequests] = useState<ImageRequest[]>([])
   const [assets, setAssets] = useState<EducationalAsset[]>([])
   const [reviewAssets, setReviewAssets] = useState<EducationalAsset[]>([])
+  const [reviewHistory, setReviewHistory] = useState<AssetReviewHistoryEntry[]>([])
   const [memberships, setMemberships] = useState<Membership[]>([])
   const [budgetEntries, setBudgetEntries] = useState<BudgetEntry[]>([])
   const [search, setSearch] = useState('')
@@ -157,20 +161,31 @@ export function WorkspacePage({ page }: { page: WorkspacePageName }) {
     return () => { active = false }
   }, [demoMode, page, search, setCountryIso, setCurrency, user])
 
-  const reviewSchoolId = memberships.find((membership) => membership.role === 'admin')?.school_id
+  const reviewSchoolIds = memberships.filter((membership) => membership.role === 'admin').map((membership) => membership.school_id)
   useEffect(() => {
-    if (demoMode || page !== 'library' || !reviewSchoolId) {
+    if (demoMode || page !== 'library' || (reviewSchoolIds.length === 0 && !user)) {
       setReviewAssets([])
+      setReviewHistory([])
       return
     }
     let active = true
-    void loadAssetsForReview(reviewSchoolId).then((items) => {
-      if (active) setReviewAssets(items)
+    const reviewQueues = [
+      ...reviewSchoolIds.map((schoolId) => loadAssetsForReview(schoolId)),
+      ...(user ? [loadAssetsForReview(null)] : []),
+    ]
+    void Promise.all([
+      Promise.all(reviewQueues),
+      user ? loadAssetReviewHistory() : Promise.resolve([] as AssetReviewHistoryEntry[]),
+    ]).then(([queues, history]) => {
+      if (active) {
+        setReviewAssets([...new Map(queues.flat().map((asset) => [asset.id, asset])).values()])
+        setReviewHistory(history)
+      }
     }).catch((reviewError: unknown) => {
       if (active) setError(reviewError instanceof Error ? reviewError.message : 'Could not load images for review.')
     })
     return () => { active = false }
-  }, [demoMode, page, reviewSchoolId])
+  }, [demoMode, page, reviewSchoolIds.join(','), user])
 
   const visibleRequests = useMemo(() => requests, [requests])
   const visibleAssets = useMemo(() => assets.filter((asset) =>
@@ -245,16 +260,23 @@ export function WorkspacePage({ page }: { page: WorkspacePageName }) {
     setNotice('The school budget was updated.')
   }
 
-  const approveAsset = async (asset: EducationalAsset) => {
+  const reviewAsset = async (asset: EducationalAsset, decision: 'approved' | 'rejected', note: string) => {
     setNotice(null)
     setError(null)
     try {
-      await approveSchoolAsset(asset.id)
+      if (decision === 'approved') await approveSchoolAsset(asset.id, note)
+      else await rejectSchoolAsset(asset.id, note)
       setReviewAssets((current) => current.filter((item) => item.id !== asset.id))
-      setAssets((current) => [{ ...asset, review_state: 'approved' }, ...current])
-      setNotice('The image is approved and can now be reused by school members.')
+      if (decision === 'approved') {
+        setAssets((current) => [{ ...asset, review_state: 'approved' }, ...current.filter((item) => item.id !== asset.id)])
+        setNotice('The image is approved and can now be reused in its permitted scope.')
+      } else {
+        setAssets((current) => current.filter((item) => item.id !== asset.id))
+        setNotice('The image was rejected and will not be available for reuse.')
+      }
+      setReviewHistory(await loadAssetReviewHistory())
     } catch (reviewError) {
-      setError(reviewError instanceof Error ? reviewError.message : 'Could not approve this image.')
+      setError(reviewError instanceof Error ? reviewError.message : `Could not ${decision === 'approved' ? 'approve' : 'reject'} this image.`)
     }
   }
 
@@ -305,6 +327,7 @@ export function WorkspacePage({ page }: { page: WorkspacePageName }) {
             requests={visibleRequests}
             assets={visibleAssets}
             reviewAssets={reviewAssets}
+            reviewHistory={reviewHistory}
             memberships={memberships}
             schoolBudgetEntries={schoolBudgetEntries}
             spendThisMonth={spendThisMonth}
@@ -338,7 +361,7 @@ export function WorkspacePage({ page }: { page: WorkspacePageName }) {
             setBudget={setBudget}
             onSaveSettings={saveSettings}
             onUpdateBudget={updateSchoolBudget}
-            onApproveAsset={approveAsset}
+            onReviewAsset={reviewAsset}
             userEmail={user?.email ?? null}
           />
         )}
@@ -352,6 +375,7 @@ type WorkspaceContentProps = {
   requests: ImageRequest[]
   assets: EducationalAsset[]
   reviewAssets: EducationalAsset[]
+  reviewHistory: AssetReviewHistoryEntry[]
   memberships: Membership[]
   schoolBudgetEntries: BudgetEntry[]
   spendThisMonth: number
@@ -385,23 +409,24 @@ type WorkspaceContentProps = {
   setBudget: (value: string) => void
   onSaveSettings: (event: FormEvent<HTMLFormElement>) => void
   onUpdateBudget: (event: FormEvent<HTMLFormElement>) => void
-  onApproveAsset: (asset: EducationalAsset) => void
+  onReviewAsset: (asset: EducationalAsset, decision: 'approved' | 'rejected', note: string) => void
   userEmail: string | null
 }
 
 function WorkspaceContent(props: WorkspaceContentProps) {
   const {
-    page, requests, assets, reviewAssets, memberships, schoolBudgetEntries, spendThisMonth, school, isSchoolAdmin,
+    page, requests, assets, reviewAssets, reviewHistory, memberships, schoolBudgetEntries, spendThisMonth, school, isSchoolAdmin,
     search, setSearch, assetIntentFilter, setAssetIntentFilter, assetCategoryFilter, setAssetCategoryFilter,
     assetAudienceFilter, setAssetAudienceFilter,
     assetLanguageFilter, setAssetLanguageFilter, formatMoney, countryIso, currency, currencyOverridden, setCurrency, resetCurrency,
     language, setLanguage, defaultCategory, setDefaultCategory, defaultAudience, setDefaultAudience, style, setStyle, budget, setBudget,
-    onSaveSettings, onUpdateBudget, onApproveAsset, userEmail,
+    onSaveSettings, onUpdateBudget, onReviewAsset, userEmail,
   } = props
   const [analyticsMonth, setAnalyticsMonth] = useState('')
   const [analyticsSchool, setAnalyticsSchool] = useState('')
   const [analyticsIntent, setAnalyticsIntent] = useState('')
   const [analyticsMethod, setAnalyticsMethod] = useState('')
+  const [reviewNotes, setReviewNotes] = useState<Record<string, string>>({})
   const analyticsRequests = requests.filter((request) =>
     (!analyticsMonth || request.created_at.slice(0, 7) === analyticsMonth)
     && (!analyticsSchool || request.school_id === analyticsSchool)
@@ -491,14 +516,42 @@ function WorkspaceContent(props: WorkspaceContentProps) {
           </article>
         ))}</div>
       )}
-      {isSchoolAdmin && reviewAssets.length > 0 && <section className="asset-review-section">
-        <h3>Images waiting for approval</h3>
+      {reviewAssets.length > 0 && <section className="asset-review-section">
+        <h3>Images waiting for review</h3>
+        <p className="field-hint">File checks confirm basic format and size only; they do not verify educational accuracy, safety, or suitability.</p>
         <div className="asset-grid">{reviewAssets.map((asset) => <article className="asset-card" key={asset.id}>
           <span className="asset-kind">Needs review</span><h4>{asset.title}</h4>
           {asset.preview_url && <img className="asset-preview" src={asset.preview_url} alt={asset.title} />}
           <p>{asset.description}</p><p className="asset-licence">Review image, content and sharing rights before approving.</p>
-          <button className="primary-button" type="button" onClick={() => void onApproveAsset(asset)}>Approve for school</button>
+          <label htmlFor={`review-note-${asset.id}`}>Review note (required when rejecting)
+            <textarea
+              id={`review-note-${asset.id}`}
+              maxLength={1000}
+              value={reviewNotes[asset.id] ?? ''}
+              onChange={(event) => setReviewNotes((current) => ({ ...current, [asset.id]: event.target.value }))}
+              placeholder="Add feedback or explain the decision"
+            />
+          </label>
+          <button className="primary-button" type="button" onClick={() => onReviewAsset(asset, 'approved', reviewNotes[asset.id] ?? '')}>Approve for permitted reuse</button>
+          <button
+            className="ghost-button"
+            type="button"
+            disabled={!(reviewNotes[asset.id] ?? '').trim()}
+            onClick={() => onReviewAsset(asset, 'rejected', reviewNotes[asset.id] ?? '')}
+          >Reject with feedback</button>
         </article>)}</div>
+      </section>}
+      {reviewHistory.length > 0 && <section className="asset-review-section">
+        <h3>Recent image-review decisions</h3>
+        <div className="table-wrap"><table><thead><tr><th>Image</th><th>Decision</th><th>Reviewer ID</th><th>Note</th><th>Date</th></tr></thead><tbody>
+          {reviewHistory.map((event) => <tr key={event.id}>
+            <td>{event.asset_title}</td>
+            <td>{event.new_state}</td>
+            <td>{event.reviewer_id}</td>
+            <td>{event.note || 'No note recorded'}</td>
+            <td>{new Date(event.created_at).toLocaleString()}</td>
+          </tr>)}
+        </tbody></table></div>
       </section>}
     </section>
   )
@@ -508,7 +561,7 @@ function WorkspaceContent(props: WorkspaceContentProps) {
       <div className="section-heading"><div><p className="eyebrow">Your requests</p><h3>Recent image activity</h3></div><ClipboardList size={18} /></div>
       {requests.length === 0 ? <EmptyState text="Your saved image requests will appear here." /> : (
         <div className="table-wrap"><table><thead><tr><th>Prompt</th><th>Category</th><th>Target audience</th><th>Purpose</th><th>Quality</th><th>Status</th><th>Cost type</th><th>Date</th></tr></thead><tbody>
-          {requests.map((request) => <tr key={request.id}><td>{request.prompt}</td><td>{categoryLabels[request.category]}</td><td>{request.target_audience}</td><td>{displayIntent(request.intent)}</td><td>{request.quality_tier}</td><td><span className={`request-state state-${request.state}`}>{displayStatus(request.state)}</span></td><td>{request.cost_source}</td><td>{new Date(request.created_at).toLocaleDateString()}</td></tr>)}
+          {requests.map((request) => <tr key={request.id}><td>{request.prompt}</td><td>{categoryLabels[request.category]}</td><td>{request.target_audience}</td><td>{displayIntent(request.intent)}</td><td>{request.quality_tier}</td><td><span className={`request-state state-${request.state}`}>{displayStatus(request.state)}{request.state === 'uncertain' ? ' — do not resubmit; administrator review required' : ''}</span></td><td>{request.cost_source}</td><td>{new Date(request.created_at).toLocaleDateString()}</td></tr>)}
         </tbody></table></div>
       )}
     </section>

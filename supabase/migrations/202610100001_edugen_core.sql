@@ -410,8 +410,8 @@ begin
   end if;
   insert into public.school_budget_reservations
     (school_id, image_request_id, amount, currency)
-    values (target_school_id, target_request_id, estimated_amount, school_currency);
-  returning id into reservation_id;
+    values (target_school_id, target_request_id, estimated_amount, school_currency)
+    returning id into reservation_id;
   return reservation_id;
 end;
 $$;

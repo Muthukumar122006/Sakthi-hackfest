@@ -1,4 +1,12 @@
 import { createClient } from 'npm:@supabase/supabase-js@2'
+import {
+  buildGenerationPrompt,
+  createRequestFingerprint,
+  hasValidPng,
+  isBase64Payload,
+  providerOutcomeIsUncertain,
+  supportsGptImage2Config,
+} from '../_shared/image-helpers.mjs'
 
 const appOrigin = Deno.env.get('APP_ORIGIN')?.trim() || 'http://127.0.0.1:5173'
 const parsedAppOrigin = new URL(appOrigin)
@@ -75,7 +83,26 @@ const audiences = new Set([
 ])
 
 function json(status: number, body: Record<string, unknown>) {
-  return new Response(JSON.stringify(body), {
+  const errorMessage = typeof body.error === 'string' ? body.error : null
+  const payload = errorMessage
+    ? {
+      success: false,
+      error: {
+        code: status === 400 ? 'VALIDATION_ERROR'
+          : status === 401 ? 'AUTHENTICATION_REQUIRED'
+          : status === 403 ? 'FORBIDDEN'
+          : status === 404 ? 'NOT_FOUND'
+          : status === 409 ? 'CONFLICT'
+          : status === 413 ? 'PAYLOAD_TOO_LARGE'
+          : status === 429 ? 'RATE_LIMITED'
+          : status === 502 ? 'PROVIDER_ERROR'
+          : status >= 500 ? 'SERVICE_ERROR'
+          : 'REQUEST_ERROR',
+        message: errorMessage,
+      },
+    }
+    : { success: true, ...body }
+  return new Response(JSON.stringify(payload), {
     status,
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   })
@@ -123,6 +150,36 @@ async function readBoundedJson(request: Request): Promise<
   }
 }
 
+async function readBoundedResponseJson(response: Response, maximumBytes: number): Promise<unknown | null> {
+  if (!response.body) return null
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      totalBytes += value.byteLength
+      if (totalBytes > maximumBytes) {
+        await reader.cancel()
+        return null
+      }
+      chunks.push(value)
+    }
+    const bytes = new Uint8Array(totalBytes)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown
+  } catch {
+    return null
+  } finally {
+    reader.releaseLock()
+  }
+}
+
 function sha256(bytes: Uint8Array) {
   const digestInput = new Uint8Array(bytes.byteLength)
   digestInput.set(bytes)
@@ -145,10 +202,20 @@ function requestFingerprint(request: GenerateRequest) {
   return sha256(new TextEncoder().encode(exactRequest))
 }
 
+function idempotencyFingerprint(
+  request: GenerateRequest,
+  schoolId: string | null,
+  providerMethod: string | null,
+  imageSize: string | null,
+) {
+  return createRequestFingerprint(request, schoolId, providerMethod, imageSize)
+}
+
 async function getUsdRate(currency: string) {
-  if (currency === 'USD') return { rate: 1, date: null as string | null }
+  if (currency === 'USD') return { rate: 1, date: null as string | null, sourceUrl: null as string | null }
   if (!/^[A-Z]{3}$/.test(currency)) throw new Error('Choose a valid currency code.')
-  const response = await fetch(`https://api.frankfurter.dev/v1/latest?base=USD&symbols=${currency}`, {
+  const sourceUrl = `https://api.frankfurter.dev/v1/latest?base=USD&symbols=${currency}`
+  const response = await fetch(sourceUrl, {
     signal: AbortSignal.timeout(8000),
   })
   if (!response.ok) throw new Error(`Could not get the USD to ${currency} exchange rate.`)
@@ -157,15 +224,7 @@ async function getUsdRate(currency: string) {
   if (!result.date || typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0) {
     throw new Error(`No USD to ${currency} exchange rate is available.`)
   }
-  return { rate, date: result.date }
-}
-
-function hasValidPng(bytes: Uint8Array) {
-  const signature = [137, 80, 78, 71, 13, 10, 26, 10]
-  if (bytes.length < 33 || !signature.every((value, index) => bytes[index] === value)) return false
-  const width = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(16)
-  const height = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(20)
-  return width >= 512 && height >= 512
+  return { rate, date: result.date, sourceUrl }
 }
 
 function validateRequest(value: unknown): GenerateRequest | null {
@@ -198,7 +257,13 @@ function validateRequest(value: unknown): GenerateRequest | null {
 Deno.serve(async (request) => {
   const requestOrigin = request.headers.get('Origin')
   if (requestOrigin && requestOrigin !== appOrigin) {
-    return new Response('Origin not allowed.', { status: 403, headers: { 'Vary': 'Origin' } })
+    return new Response(JSON.stringify({
+      success: false,
+      error: { code: 'FORBIDDEN', message: 'Origin not allowed.' },
+    }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json', 'Vary': 'Origin' },
+    })
   }
   if (request.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
   if (request.method !== 'POST') return json(405, { error: 'Use POST to create an image.' })
@@ -225,6 +290,7 @@ Deno.serve(async (request) => {
   const body = parsedBody.body
   const input = validateRequest(body)
   if (!input) return json(400, { error: 'Check the image description, class, language, style, purpose and budget fields.' })
+  const fullPrompt = buildGenerationPrompt(input)
 
   const service = createClient(supabaseUrl, serviceKey, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -246,13 +312,35 @@ Deno.serve(async (request) => {
   }
 
   const { data: priorRequest, error: priorRequestError } = await service.from('image_requests')
-    .select('id,state,output_asset_id,reused_asset_id,method,quality_tier,requested_image_size,baseline_estimate,optimized_estimate,savings_estimate,savings_percentage,estimate_currency,calculation_method,pricing_source_url,pricing_effective_from,cost_source')
+    .select('id,state,output_asset_id,reused_asset_id,method,quality_tier,requested_image_size,request_fingerprint,baseline_estimate,optimized_estimate,savings_estimate,savings_percentage,estimate_currency,calculation_method,pricing_source_url,pricing_effective_from,cost_source')
     .eq('user_id', authData.user.id)
     .eq('idempotency_key', input.idempotency_key)
     .maybeSingle()
   if (priorRequestError) return json(500, { error: 'Could not check for a duplicate image request.' })
   if (priorRequest) {
-    if (priorRequest.state === 'queued') return json(409, { error: 'This image request is already being processed.' })
+    const retryFingerprint = await idempotencyFingerprint(
+      input,
+      schoolId,
+      priorRequest.method,
+      priorRequest.requested_image_size,
+    )
+    if (!priorRequest.request_fingerprint || priorRequest.request_fingerprint !== retryFingerprint) {
+      return json(409, { error: 'This request key was already used for different or unverifiable input. Start a new request with a new key.' })
+    }
+    if (priorRequest.state === 'uncertain') {
+      return json(202, {
+        request_id: priorRequest.id,
+        state: 'uncertain',
+        message: 'The provider may have completed this request, but its result could not be confirmed. Do not resubmit it; an administrator must reconcile the request.',
+      })
+    }
+    if (priorRequest.state === 'queued') {
+      return json(202, {
+        request_id: priorRequest.id,
+        state: 'queued',
+        message: 'This image request is still being processed. Wait, then retry with the same request key; do not start a new generation.',
+      })
+    }
     if (priorRequest.state !== 'generated' && priorRequest.state !== 'reused') {
       return json(409, { error: 'This request already failed. Start a new request to try again.' })
     }
@@ -291,12 +379,6 @@ Deno.serve(async (request) => {
     })
   }
 
-  const { data: withinLimit, error: limitError } = await service.rpc('consume_generation_rate_limit', {
-    target_user_id: authData.user.id,
-  })
-  if (limitError) return json(503, { error: 'Could not check the image request limit. Please try again shortly.' })
-  if (withinLimit !== true) return json(429, { error: 'You have reached the image request limit of 10 per hour. Try again later.' })
-
   const today = new Date().toISOString().slice(0, 10)
   const { data: baselinePrice, error: baselinePriceError } = await service.from('provider_pricing')
     .select('cost_per_image,source_url,effective_from')
@@ -309,6 +391,16 @@ Deno.serve(async (request) => {
     .limit(1)
     .maybeSingle()
   if (baselinePriceError) return json(500, { error: 'Could not load the configured Studio Pro baseline price.' })
+  if (baselinePrice && (
+    baselinePrice.currency !== 'USD'
+    || !Number.isFinite(Number(baselinePrice.cost_per_image))
+    || Number(baselinePrice.cost_per_image) < 0
+    || typeof baselinePrice.source_url !== 'string'
+    || !baselinePrice.source_url.startsWith('https://')
+    || typeof baselinePrice.effective_from !== 'string'
+  )) {
+    return json(503, { error: 'The active Studio Pro baseline price is incomplete or invalid. Ask an administrator to review it.' })
+  }
 
   const fingerprint = await requestFingerprint(input)
   let assetQuery = service.from('educational_assets')
@@ -331,10 +423,14 @@ Deno.serve(async (request) => {
       .from('educational-images')
       .createSignedUrl(cachedAsset.storage_path, 300)
     if (signedFileError) return json(500, { error: 'The reusable image could not be opened.' })
+    const reuseMethod = 'Exact approved library match'
+    const reuseFingerprint = await idempotencyFingerprint(input, schoolId, reuseMethod, null)
     const { data: savedRequest, error: saveError } = await service.from('image_requests')
       .insert({
         user_id: authData.user.id,
         idempotency_key: input.idempotency_key,
+        request_fingerprint: reuseFingerprint,
+        source_prompt_hash: fingerprint,
         school_id: schoolId,
         prompt: input.prompt,
         category: input.category,
@@ -348,7 +444,7 @@ Deno.serve(async (request) => {
         display_currency: input.display_currency,
         state: 'reused',
         requested_image_size: null,
-        method: 'Exact approved library match',
+        method: reuseMethod,
         reused_asset_id: cachedAsset.id,
         provider_currency: 'USD',
         baseline_estimate: baselinePrice ? Number(baselinePrice.cost_per_image) : null,
@@ -358,6 +454,8 @@ Deno.serve(async (request) => {
         calculation_method: 'Studio Pro published USD estimate minus avoided image-generation API call; other hosting or service costs are not included.',
         pricing_effective_from: today,
         pricing_source_url: baselinePrice?.source_url ?? null,
+        baseline_pricing_effective_from: baselinePrice?.effective_from ?? null,
+        baseline_pricing_source_url: baselinePrice?.source_url ?? null,
         estimate_currency: 'USD',
         exchange_rate: input.display_currency === 'USD' ? 1 : null,
         cost_source: 'estimated',
@@ -411,31 +509,48 @@ Deno.serve(async (request) => {
     .maybeSingle()
   if (selectedPriceError) return json(500, { error: 'Could not load the configured provider price.' })
   if (!selectedPrice) return json(503, { error: 'No current, source-linked provider price is configured for this quality. An admin must add one before generation.' })
-  if (!selectedPrice.source_url.startsWith('https://')) return json(503, { error: 'The provider price must include a source link.' })
+  if (selectedPrice.provider !== provider
+    || selectedPrice.currency !== 'USD'
+    || selectedPrice.quality_tier !== input.quality_tier
+    || !Number.isFinite(Number(selectedPrice.cost_per_image))
+    || Number(selectedPrice.cost_per_image) < 0
+    || typeof selectedPrice.model !== 'string'
+    || typeof selectedPrice.image_size !== 'string'
+    || typeof selectedPrice.source_url !== 'string'
+    || !selectedPrice.source_url.startsWith('https://')
+    || typeof selectedPrice.effective_from !== 'string') {
+    return json(503, { error: 'The active provider pricing configuration is incomplete or inconsistent. Ask an administrator to review it.' })
+  }
+  const providerQuality = input.quality_tier === 'studio-pro'
+    ? 'high'
+    : input.quality_tier === 'precision-lite' ? 'medium' : 'low'
+  if (!supportsGptImage2Config(selectedPrice.model, selectedPrice.image_size, providerQuality)) {
+    return json(503, { error: 'The configured model, image size, or quality is not supported by the GPT Image 2 generation endpoint.' })
+  }
 
   if (!baselinePrice) return json(503, { error: 'Add a current Studio Pro baseline price before generation so savings can be compared fairly.' })
 
   let budgetRate = 1
   let budgetRateDate: string | null = null
+  let budgetRateSourceUrl: string | null = null
   let targetBudgetRate = 1
   let targetBudgetRateDate: string | null = null
-  let displayRate = 1
-  let displayRateDate: string | null = null
+  let targetBudgetRateSourceUrl: string | null = null
+  const displayRate = input.display_currency === 'USD' ? 1 : null
   let budgetCurrency = school?.budget_currency ?? 'USD'
   try {
-    const displayExchange = await getUsdRate(input.display_currency)
-    displayRate = displayExchange.rate
-    displayRateDate = displayExchange.date
     if (school) {
       const budgetExchange = await getUsdRate(budgetCurrency)
       budgetRate = budgetExchange.rate
       budgetRateDate = budgetExchange.date
+      budgetRateSourceUrl = budgetExchange.sourceUrl
     }
     if (input.target_budget !== undefined && input.target_budget !== null) {
       const requestBudgetCurrency = input.target_budget_currency ?? 'USD'
       const targetExchange = await getUsdRate(requestBudgetCurrency)
       targetBudgetRate = targetExchange.rate
       targetBudgetRateDate = targetExchange.date
+      targetBudgetRateSourceUrl = targetExchange.sourceUrl
       if (Number(selectedPrice.cost_per_image) * targetBudgetRate > input.target_budget) {
         return json(409, { error: 'This option costs more than your maximum budget. Choose a lower-cost quality level.' })
       }
@@ -444,10 +559,20 @@ Deno.serve(async (request) => {
     return json(503, { error: budgetError instanceof Error ? budgetError.message : 'Could not check the budget safely.' })
   }
 
+  const providerMethod = `${selectedPrice.provider}/${selectedPrice.model}`
+  const requestFingerprint = await idempotencyFingerprint(
+    input,
+    schoolId,
+    providerMethod,
+    selectedPrice.image_size,
+  )
   const { data: queuedRequest, error: insertError } = await service.from('image_requests')
     .insert({
       user_id: authData.user.id,
       school_id: schoolId,
+      request_fingerprint: requestFingerprint,
+      source_prompt_hash: fingerprint,
+      provider_prompt: fullPrompt,
       prompt: input.prompt,
       subject: '',
       grade: '',
@@ -465,11 +590,16 @@ Deno.serve(async (request) => {
       idempotency_key: input.idempotency_key,
       display_currency: input.display_currency,
       exchange_rate: displayRate,
-      exchange_rate_date: displayRateDate,
+      exchange_rate_date: null,
+      exchange_rate_source_url: null,
       school_budget_exchange_rate: school ? budgetRate : null,
       school_budget_exchange_rate_date: school ? budgetRateDate : null,
+      school_budget_exchange_rate_source_url: school ? budgetRateSourceUrl : null,
+      target_budget_exchange_rate_source_url: input.target_budget !== undefined && input.target_budget !== null
+        ? targetBudgetRateSourceUrl
+        : null,
       state: 'queued',
-      method: `${selectedPrice.provider}/${selectedPrice.model}`,
+      method: providerMethod,
       provider_currency: 'USD',
       baseline_estimate: Number(baselinePrice.cost_per_image),
       optimized_estimate: Number(selectedPrice.cost_per_image),
@@ -480,6 +610,8 @@ Deno.serve(async (request) => {
       calculation_method: 'Studio Pro published USD price minus selected-tier published USD price. Prices are estimates and exclude other service costs.',
       pricing_effective_from: selectedPrice.effective_from,
       pricing_source_url: selectedPrice.source_url,
+      baseline_pricing_effective_from: baselinePrice.effective_from,
+      baseline_pricing_source_url: baselinePrice.source_url,
       estimate_currency: 'USD',
       cost_source: 'estimated',
     })
@@ -538,51 +670,60 @@ Deno.serve(async (request) => {
     reservationId = reservedId
   }
 
-  const releaseBudget = async () => {
-    if (!reservationId) return null
-    try {
-      const { error } = await service.rpc('release_school_budget_reservation', { target_reservation_id: reservationId })
-      if (error) {
-        console.error('Could not release a school budget reservation.', reservationId, error)
-        return error
-      }
-    } catch (error) {
-      console.error('Could not reach the budget reservation service.', reservationId, error)
-      return error
-    }
-    return null
-  }
-  const failRequest = async (
-    status: number,
-    message: string,
-    extra: { quality_state?: 'failed'; quality_note?: string } = {},
-  ) => {
-    const releaseError = await releaseBudget()
-    let updateError: unknown = null
-    try {
-      const { error } = await service.from('image_requests')
-        .update({ state: 'failed', ...extra })
-        .eq('id', queuedRequest.id)
-      updateError = error
-    } catch (error) {
-      updateError = error
-    }
-    if (updateError) console.error('Could not mark a failed image request.', queuedRequest.id, updateError)
-    const cleanupFailed = Boolean(releaseError || updateError)
+  const failRequest = async (status: number, message: string, knownProviderRejection = false) => {
+    const { data: failed, error: failureError } = await service.rpc('fail_image_generation', {
+      target_request_id: queuedRequest.id,
+      target_reservation_id: reservationId,
+      target_error_code: status === 429 ? 'generation_rate_limited' : 'generation_failed',
+      target_quality_note: null,
+      target_known_rejection: knownProviderRejection,
+    })
+    if (failureError) console.error('Could not atomically fail an image request.', queuedRequest.id, failureError)
+    const cleanupFailed = Boolean(failureError || failed !== true)
     return json(status, {
       error: cleanupFailed
-        ? `${message} The request cleanup failed and needs administrator attention.`
+        ? `${message} The request state or budget reservation could not be confirmed; administrator attention is required.`
         : message,
     })
   }
-  const fullPrompt = [
-    `Make an image for the ${input.category} category${input.custom_category ? ` (${input.custom_category})` : ''}.`,
-    `Target audience: ${input.target_audience}. Adjust visual complexity, tone, detail and accessibility for this audience.`,
-    `Purpose: ${input.intent.replace(/_/g, ' ')}.`,
-    `Language: ${input.language}.`,
-    `Style: ${input.style}.`,
-    input.prompt,
-  ].join('\n')
+  const markUncertain = async (errorCode: string, message: string) => {
+    const { data: updated, error: updateError } = await service.from('image_requests')
+      .update({ state: 'uncertain', provider_error_code: errorCode })
+      .eq('id', queuedRequest.id)
+      .eq('state', 'queued')
+      .select('id')
+      .maybeSingle()
+    if (updateError) {
+      console.error('Could not mark an image request uncertain.', queuedRequest.id, updateError)
+      return json(503, { error: 'The provider outcome could not be confirmed and the request state needs administrator attention. Do not resubmit this generation.' })
+    }
+    if (!updated) {
+      const { data: currentRequest, error: lookupError } = await service.from('image_requests')
+        .select('state')
+        .eq('id', queuedRequest.id)
+        .maybeSingle()
+      if (lookupError) console.error('Could not verify an uncertain image request.', queuedRequest.id, lookupError)
+      if (currentRequest?.state !== 'uncertain') {
+        return json(503, { error: 'The provider outcome could not be confirmed. Do not resubmit this generation; an administrator must reconcile its state.' })
+      }
+    }
+    return json(202, {
+      request_id: queuedRequest.id,
+      state: 'uncertain',
+      message,
+    })
+  }
+  const { data: attemptClaimed, error: attemptError } = await service.rpc('claim_image_provider_attempt', {
+    target_request_id: queuedRequest.id,
+  })
+  if (attemptError) {
+    console.error('Could not claim the provider generation slot.', queuedRequest.id, attemptError)
+    return failRequest(503, 'The generation limit could not be checked safely. Try again later.', true)
+  }
+  if (attemptClaimed !== true) {
+    return failRequest(429, 'You have reached the image request limit of 10 provider attempts per hour. Try again later.')
+  }
+
   let providerResponse: Response
   try {
     providerResponse = await fetch('https://api.openai.com/v1/images/generations', {
@@ -598,48 +739,63 @@ Deno.serve(async (request) => {
       }),
     })
   } catch (providerError) {
-    console.error('The image provider request failed.', queuedRequest.id, providerError)
-    return failRequest(502, 'The image provider could not be reached. Your request was marked as failed.')
+    const errorName = providerError instanceof Error ? providerError.name : 'UnknownError'
+    console.error('The image provider outcome is uncertain.', queuedRequest.id, errorName)
+    return markUncertain('provider_transport_outcome_unknown', 'The provider request timed out or lost its connection. It may have generated an image; do not resubmit. An administrator must reconcile it.')
   }
 
   if (!providerResponse.ok) {
     console.error('The image provider rejected the generation request.', queuedRequest.id, providerResponse.status)
-    return failRequest(502, `The image provider returned an error (${providerResponse.status}).`)
+    if (providerOutcomeIsUncertain(providerResponse.status)) {
+      return markUncertain('provider_server_outcome_unknown', `The provider returned HTTP ${providerResponse.status}; it may have processed the request. Do not resubmit it; an administrator must reconcile the outcome.`)
+    }
+    if (providerResponse.status === 429) {
+      return failRequest(503, 'The image provider is rate limiting requests. Wait briefly before trying again.', true)
+    }
+    return failRequest(
+      502,
+      `The image provider returned an error (${providerResponse.status}).`,
+      providerResponse.status >= 400 && providerResponse.status < 500,
+    )
   }
 
-  let providerResult: { data?: { b64_json?: string }[] }
-  try {
-    providerResult = await providerResponse.json() as { data?: { b64_json?: string }[] }
-  } catch {
-    return failRequest(502, 'The image provider returned an invalid response. Your request was marked as failed.')
+  const responseContentType = providerResponse.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase()
+  const contentLengthHeader = providerResponse.headers.get('Content-Length')
+  const responseContentLength = contentLengthHeader === null ? 0 : Number(contentLengthHeader)
+  if (responseContentType !== 'application/json'
+    || (contentLengthHeader !== null
+      && (!/^\d+$/.test(contentLengthHeader) || !Number.isSafeInteger(responseContentLength)
+        || responseContentLength > maximumBase64ImageLength + 65536))) {
+    return markUncertain('provider_response_format_unknown', 'The provider succeeded but returned an unexpected or oversized response. Do not resubmit; an administrator must reconcile it.')
   }
-  const encodedImage = providerResult.data?.[0]?.b64_json
-  if (!encodedImage) {
+  const providerResult = await readBoundedResponseJson(providerResponse, maximumBase64ImageLength + 65536)
+  if (providerResult === null) {
+    return markUncertain('provider_response_json_invalid', 'The provider may have generated an image, but its response could not be read within the safety limit. Do not resubmit; an administrator must reconcile it.')
+  }
+  const responseData = isRecord(providerResult) && Array.isArray(providerResult.data)
+    ? providerResult.data[0]
+    : null
+  const encodedImage = isRecord(responseData) ? responseData.b64_json : null
+  if (typeof encodedImage !== 'string' || !encodedImage) {
     console.error('The image provider response did not contain base64 image data.', queuedRequest.id)
-    return failRequest(502, 'The image provider returned no image. The request was marked as failed.')
+    return markUncertain('provider_image_missing', 'The provider may have generated an image but returned no usable image data. Do not resubmit; an administrator must reconcile it.')
   }
-  if (encodedImage.length > maximumBase64ImageLength || encodedImage.length % 4 !== 0) {
+  if (!isBase64Payload(encodedImage, maximumBase64ImageLength)) {
     console.error('The image provider returned an image payload outside the supported size or format.', queuedRequest.id)
-    return failRequest(502, 'The generated image is invalid or larger than the 10 MiB storage limit.')
+    return markUncertain('provider_image_payload_invalid', 'The provider returned image data that failed the safety and size limits. Do not resubmit; an administrator must reconcile the request.')
   }
   let imageBytes: Uint8Array
   try {
     imageBytes = Uint8Array.from(atob(encodedImage), (character) => character.charCodeAt(0))
   } catch (decodeError) {
     console.error('The image provider response contained invalid base64 data.', queuedRequest.id, decodeError)
-    return failRequest(502, 'The image provider returned invalid image data. Your request was marked as failed.')
+    return markUncertain('provider_image_decode_failed', 'The provider returned image data that could not be decoded. Do not resubmit; an administrator must reconcile the request.')
   }
   if (!hasValidPng(imageBytes)) {
-    return failRequest(502, 'The returned image did not pass the basic file and size check.', {
-      quality_state: 'failed',
-      quality_note: 'The output was empty, too small, or not a valid PNG image.',
-    })
+    return markUncertain('provider_image_validation_failed', 'The provider returned an image that did not pass basic PNG validation. Do not resubmit; an administrator must reconcile the request.')
   }
   if (imageBytes.byteLength > maximumImageBytes) {
-    return failRequest(502, 'The generated image is larger than the 10 MiB storage limit.', {
-      quality_state: 'failed',
-      quality_note: 'The PNG exceeds the configured private storage file-size limit.',
-    })
+    return markUncertain('provider_image_exceeds_storage_limit', 'The generated image exceeds the configured storage limit. Do not resubmit; an administrator must reconcile the request.')
   }
 
   const storagePath = schoolId
@@ -651,7 +807,8 @@ Deno.serve(async (request) => {
     { contentType: 'image/png', upsert: false },
   )
   if (uploadError) {
-    return failRequest(500, 'The image was created but could not be saved securely.')
+    console.error('Could not safely confirm image upload.', queuedRequest.id, uploadError)
+    return markUncertain('storage_upload_outcome_unknown', 'The image was generated but its storage status could not be confirmed. Do not resubmit; an administrator must reconcile it.')
   }
 
   let assetId: string | null = null
@@ -676,16 +833,19 @@ Deno.serve(async (request) => {
       .maybeSingle()
     if (verifyError) {
       console.error('Could not verify the image request after a completion error.', queuedRequest.id, verifyError)
-      return json(503, { error: 'The completion status could not be confirmed. Retry this request shortly; do not submit a duplicate.' })
+      return markUncertain('completion_status_unknown', 'The image was uploaded but the saved request state could not be confirmed. Do not resubmit; an administrator must reconcile it.')
     }
     if (persistedRequest?.state === 'generated' && persistedRequest.output_asset_id) {
       assetId = persistedRequest.output_asset_id
     } else {
       const { error: removeError } = await service.storage.from('educational-images').remove([storagePath])
       if (removeError) console.error('Could not remove an unindexed image file.', storagePath, removeError)
-      const failure = await failRequest(500, 'The generated image could not be finalized.')
-      if (removeError) return json(500, { error: 'The image could not be finalized, and its temporary file needs administrator cleanup.' })
-      return failure
+      return markUncertain(
+        removeError ? 'completion_cleanup_failed' : 'completion_failed',
+        removeError
+          ? 'The image was uploaded but could not be finalized or safely cleaned up. Do not resubmit; an administrator must reconcile it.'
+          : 'The provider returned an image but the request could not be finalized. Do not resubmit; an administrator must reconcile it.',
+      )
     }
   }
   if (!assetId) {
@@ -701,7 +861,10 @@ Deno.serve(async (request) => {
     image_url: signedFile.signedUrl,
     asset_id: assetId,
     state: 'generated',
+    provider: selectedPrice.provider,
+    pricing_unit: 'per_image',
     quality_state: 'not_checked',
+    quality_tier: input.quality_tier,
     cost_source: 'estimated',
     estimated_provider_cost: Number(selectedPrice.cost_per_image),
     provider_currency: 'USD',
